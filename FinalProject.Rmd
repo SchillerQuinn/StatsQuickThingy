@@ -1,0 +1,365 @@
+---
+title: "Faa"
+author: "Quinn Schiller"
+date: "5/25/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lme4)
+library(TMB)
+library(glmmTMB)
+library(pscl)
+countNull <- function(x){sum(is.na(x))}
+percentNull <- function(x){sum(is.na(x))/length(x)}
+na_count <-function(x){data.frame(sapply(x, function(y) sum(length(which(is.na(y))))))}
+
+#modified from Laura 
+modelCounts <- function (model, len=15)
+{
+    #counts/predicted counts for poisson, negative binomial and zip
+    maxcount <- max(as.numeric(names(table((model@resp$y)))))
+    len <- min(maxcount, len)
+    y <- model@resp$y[model@resp$y < len +1]
+    obs <- as.data.frame(table(y))
+    names(obs) <- c("Count", "Observed")
+
+    muhat <- predict(model, type="response")
+    pred <- data.frame(Count=0:len, Predicted=
+    sapply(0:len, function(i) round(sum(dpois(i, lambda=muhat)),4)))
+    out <- merge(pred, obs, all = TRUE)
+    out$Observed[is.na(out$Observed)] <- 0
+    out$Diff <- with(out, Observed - Predicted[1:(len + 1)])
+    return(out[, c(1, 3, 2, 4)])
+}
+
+
+suppressWarnings(suppressMessages(faa  <-read_csv("faa-wildlife-strikes.csv")%>%
+  filter(INCIDENT_YEAR >1999) ))
+
+
+suppressWarnings(suppressMessages(airports <- read_csv("airports.csv") 
+                                  %>% select(ident, type, name,municipality, iso_region)))
+
+
+strikes <- left_join(faa, airports, by= c("AIRPORT_ID" = "ident")) %>% 
+  filter( type %in% c("large_airport", "medium_airport", "small_airport")& 
+          TYPE_ENG %in% c("A", "B", "C", "D"), #filter out helicopters) 
+          DAMAGE %in% c("M", "M?","N","S"),
+          AC_CLASS  == "A",
+          ! (PHASE_OF_FLT  %in% c("Arrival", "Departure", "Local", "Parked"))) %>% 
+  mutate(TIME_OF_DAY = tolower(TIME_OF_DAY),
+         AOS = ceiling(AOS),#poisson doesn't let you do non-ints
+         DAM_ENGINE = sign(coalesce(DAM_ENG1,0L)+coalesce(DAM_ENG2,0L)+coalesce(DAM_ENG3,0L)+coalesce(DAM_ENG4,0L)),
+         STR_ENGINE = sign(coalesce(STR_ENG1,0L)+coalesce(STR_ENG2,0L)+coalesce(STR_ENG3,0L)+coalesce(STR_ENG4,0L)),
+         dateScaled = scale(REPORTED_DATE, center=F),
+         heightScaled = scale(HEIGHT, center=F),
+         speedScaled = scale(SPEED, center=F),
+         distanceScaled = scale(DISTANCE, center=F),
+         fog = grepl("Fog" ,PRECIP),
+         rain = grepl("Rain", PRECIP),
+         snow = grepl("Snow" ,PRECIP),
+         TYPE_ENG = factor(TYPE_ENG, levels= c("A", "B", "C", "D"), 
+                           labels = c("Piston", "Turbojet", "Turboprop", "Turbofan")),
+         ruinedFlight = ! (grepl("None" ,EFFECT) | grepl("Other" ,EFFECT)) , #Was the flgiht stopped
+         year2000 = INCIDENT_YEAR-2000,
+         AC_MASS = factor(AC_MASS, levels=c(1,2,3,4,5), labels = c("0-2,250 kg", "2,251-5,700 kg", "5,701-27,000kg", "27,000-272,000kg", ">272,000 kg")))
+
+effect <- strikes %>%
+  filter(EFFECT != "Other",
+         year2000==10,
+         AC_MASS !=">272,000 kg") %>%
+  drop_na(EFFECT)
+
+bigHitters.effects <- effect %>%
+  group_by(OPID) %>%
+  tally() %>%
+  filter(n >=5)
+
+effect <- effect %>%
+  filter(OPID %in% bigHitters.effects$OPID)
+
+strAOS  <- strikes %>% 
+  drop_na(AOS)
+
+#find airlines that have more than 5 hits
+bigHitters.strAOS <- strAOS %>%
+  group_by(OPID) %>%
+  tally() %>%
+  filter(n >=5)
+
+strAOSBig <- strAOS %>%
+  filter(OPID %in% bigHitters.strAOS$OPID)
+```
+
+```{r}
+ggplot(strikes) + 
+  aes(x=type)+
+  geom_bar()
+
+
+strikes %>% 
+  group_by(OPID)  %>%
+  summarise(n = n()) %>%
+  ggplot() +
+  aes(x= n) + 
+  scale_x_log10()+
+  geom_histogram()+
+  ggtitle("Number of Hits by Airline")
+
+
+strikes %>% 
+  group_by(type, AIRPORT_ID)  %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x= n) + 
+  scale_x_log10()+
+  geom_histogram()+
+  #facet_wrap(~type, scales="free_y")+
+  ggtitle("Number of Hits by Airport")
+
+strikes %>% 
+  group_by(STATE)  %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x= n) + 
+  scale_x_log10()+
+  geom_histogram()+
+  #facet_wrap(~type)+
+  ggtitle("Number of Hits by STATE")
+
+
+#18x18x24
+strikes %>% 
+  group_by(FAAREGION)  %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  mutate(FAAREGION = factor(FAAREGION, levels=FAAREGION)) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x= FAAREGION, weight=n) + 
+  geom_bar()+
+  ggtitle("Number of Hits by FAAREGION")
+
+
+strikes %>%
+  drop_na(TIME_OF_DAY) %>%
+  ggplot() +
+  aes(x=TIME_OF_DAY) +
+  geom_bar()
+
+
+
+#we might want to do a hurdle model
+
+strikes %>%
+  group_by(AIRPORT) %>%
+  summarize(c = countNull(AOS),
+            p = percentNull(AOS),
+            n= n()) %>%
+  arrange(p, desc(n)) %>%
+    
+
+
+
+```
+
+```{r}
+ggplot(strikes) + 
+  aes(x=type)+
+  geom_bar()
+
+with(effect,
+     table(AC_MASS, ruinedFlight))
+
+strAOS %>%
+  drop_na(AOS) %>%
+  ggplot() +
+  aes(x=AOS) +
+  scale_x_log10()+
+  geom_histogram()+
+  ggtitle("Hours out of Service")
+
+
+strAOS %>% 
+  group_by(OPID)  %>%
+  summarise(AOS =mean(AOS)) %>%
+  ggplot() +
+  aes(x= AOS) + 
+  #scale_x_log10()+
+  geom_histogram()+
+  ggtitle("Average AOS by Airline")
+
+
+strAOS %>% 
+  ggplot() +
+  aes(x= as.factor(OPID), y=AOS) + 
+  scale_y_log10()+
+  geom_boxplot()+
+  ggtitle("AOS by Opperator")
+
+
+strAOS %>% 
+  group_by(type, AIRPORT_ID)  %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x= n) + 
+  scale_x_log10()+
+  geom_histogram()+
+  #facet_wrap(~type, scales="free_y")+
+  ggtitle("Number of Hits by Airport")
+
+strAOS %>% 
+  group_by(STATE)  %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x= n) + 
+  scale_x_log10()+
+  geom_histogram()+
+  #facet_wrap(~type)+
+  ggtitle("Number of Hits by STATE")
+
+
+#18x18x24
+strAOS %>% 
+  group_by(FAAREGION)  %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  mutate(FAAREGION = factor(FAAREGION, levels=FAAREGION)) %>%
+  ungroup() %>%
+  ggplot() +
+  aes(x= FAAREGION, weight=n) + 
+  geom_bar()+
+  ggtitle("Number of Hits by FAAREGION")
+
+
+strAOS %>%
+  drop_na(TIME_OF_DAY) %>%
+  ggplot() +
+  aes(x=TIME_OF_DAY) +
+  geom_bar()
+
+#we might want to do a hurdle model
+
+strikes %>%
+  group_by(AIRPORT) %>%
+  summarize(c = countNull(AOS),
+            p = percentNull(AOS),
+            n= n()) %>%
+  arrange(p, desc(n)) %>%
+    
+
+
+
+```
+
+
+
+```{r}
+strAOS.glm <- glmer(AOS ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE+ TYPE_ENG+ PRECIP + REPORTED_DATE + HEIGHT +SPEED+ DISTANCE +
+                (1|iso_region/AIRPORT) + (1|OPID), 
+              family="poisson",
+              data=strAOS)
+
+strAOS.glm1 <- glmer(AOS ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE+ TYPE_ENG+ fog + rain + snow +
+                DAM_ENGINE + dateScaled + heightScaled +speedScaled+ distanceScaled +
+                (1|iso_region/AIRPORT) + (1|OPID), 
+              family="poisson",
+              data=strAOS)
+
+strAOS.glm2 <- glmer(AOS ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE+ TYPE_ENG+ fog + rain  +
+                DAM_ENGINE + year2000 + heightScaled +speedScaled +
+                (1|iso_region/AIRPORT) + (1|OPID), 
+              family="poisson",
+              data=strAOS)
+
+
+strAOS.glm3 <- glmer(AOS ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE+ TYPE_ENG+ fog + rain  +
+                DAM_ENGINE + year2000 + heightScaled +speedScaled +AC_MASS+
+                (1|iso_region/AIRPORT) + (1|OPID), 
+              family="poisson",
+              data=strAOS)
+
+strAOSBig.glm3 <- glmer(AOS ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE + TYPE_ENG+ fog + rain  +
+                DAM_ENGINE + year2000 + heightScaled +speedScaled +AC_MASS+
+                (1|iso_region/AIRPORT) + (1|OPID), 
+              family="poisson",
+              data=strAOSBig)
+
+strAOSbigTrunc <- strAOSBig %>%
+  filter(AOS>0)
+
+strAOSBigTrunc.glm <- glmmTMB(AOS ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE + TYPE_ENG+ fog + rain  +
+                DAM_ENGINE + year2000 + heightScaled +speedScaled +AC_MASS+
+                (1|iso_region/AIRPORT) + (1|OPID), 
+              family="truncated_poisson",
+              data=strAOSbigTrunc)
+
+summary(strAOS.glm1)
+summary(strAOS.glm2)
+summary(strAOS.glm3)
+
+summary(strAOSBig.glm3)
+
+summary(strAOSBigTrunc.glm)
+
+vcov(strAOSBig.glm3)
+model.counts <- source("http://math.carleton.edu/Chihara/Stats345/Count_Function.R")$value
+
+modelCounts(strAOSBig.glm3)
+# We tried a zip model but it didnt work because it doesnt allow for mixed effects and those are very important to include here because of massive  geographic and opperator differences
+# strAOS.zip1 <- zeroinfl(AOS ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE+ TYPE_ENG+ fog + rain + snow +
+#                 DAM_ENGINE + dateScaled + heightScaled +speedScaled+ distanceScaled | DAMAGE,
+#               data=strAOS)
+# 
+# summary(strAOS.zip1)
+```
+
+
+
+```{r}
+
+ruined.glm <- glmer(ruinedFlight ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE + TYPE_ENG+ fog + rain  +
+                DAM_ENGINE  + heightScaled + speedScaled + AC_MASS +
+                (1|AIRPORT) + (1|OPID),
+                family="binomial",
+                data=effect)
+
+ruined.glm2 <- glmer(ruinedFlight ~ TIME_OF_DAY+PHASE_OF_FLT + DAMAGE +
+                DAM_ENGINE  + heightScaled +speedScaled +AC_MASS+
+                (1|AIRPORT) + (1|OPID),
+                family="binomial",
+                data=effect)
+
+ruined.glm3 <- glmer(ruinedFlight ~PHASE_OF_FLT + DAMAGE +
+                DAM_ENGINE +speedScaled +AC_MASS+
+                (1|AIRPORT) + (1|OPID),
+                family="binomial",
+                data=effect)
+
+
+ruined.glm4 <- glmer(ruinedFlight ~PHASE_OF_FLT + DAMAGE +
+                DAM_ENGINE +speedScaled +AC_MASS+ BIRDS_STRUCK+
+                (1|AIRPORT) + (1|OPID),
+                family="binomial",
+                data=effect)
+
+ggplot(effect) + aes(x=DISTANCE, fill=PHASE_OF_FLT)+ geom_histogram() + scale_y_log10() + facet_wrap(~PHASE_OF_FLT, scales="free_y") 
+# remove distance because it is explaned by PHASE_OF_FLT and its definition is a bit strange
+
+
+
+summary(ruined.glm3)
+summary(ruined.glm4)
+
+modelCounts(strAOSBig.glm3)
+```
+
